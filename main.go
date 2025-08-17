@@ -205,6 +205,40 @@ func readWAV16Mono(path string) (sr int, samples []int16, err error) {
 }
 
 // synthTone generates a sine wave tone with given frequency, duration, sample rate, amplitude, and phase.
+// butterworthLowPass applies a simple 2nd-order Butterworth low-pass filter to mono PCM samples.
+func butterworthLowPass(samples []int16, sr int, cutoff float64) []int16 {
+	// Coefficients for 2nd-order Butterworth
+	// Reference: https://www.dsprelated.com/showarticle/1119.php
+	wc := 2 * math.Pi * cutoff / float64(sr)
+	k := math.Tan(wc / 2)
+	norm := 1 / (1 + math.Sqrt(2)*k + k*k)
+	a0 := k * k * norm
+	a1 := 2 * a0
+	a2 := a0
+	b1 := 2 * (k*k - 1) * norm
+	b2 := (1 - math.Sqrt(2)*k + k*k) * norm
+
+	// Filter state
+	var x1, x2, y1, y2 float64
+	out := make([]int16, len(samples))
+	for i := 0; i < len(samples); i++ {
+		x0 := float64(samples[i])
+		y0 := a0*x0 + a1*x1 + a2*x2 - b1*y1 - b2*y2
+		// Clamp to int16
+		if y0 > 32767 {
+			y0 = 32767
+		}
+		if y0 < -32768 {
+			y0 = -32768
+		}
+		out[i] = int16(y0)
+		x2 = x1
+		x1 = x0
+		y2 = y1
+		y1 = y0
+	}
+	return out
+}
 func synthTone(freq float64, n int, sr int, amp float64, phaseStart float64, win []float64) ([]float64, float64) {
 	y := make([]float64, n)
 	phase := phaseStart
@@ -502,6 +536,11 @@ func decodeWAVToFile(inPath, outPath string, cfg Config) error {
 	if sr != cfg.SampleRate {
 		return fmt.Errorf("sample rate mismatch: expected %d, got %d", cfg.SampleRate, sr)
 	}
+
+	// Apply Butterworth low-pass filter to reduce tape noise
+	maxFreq := cfg.Frequencies[len(cfg.Frequencies)-1]
+	cutoff := maxFreq * 1.2 // 20% above max symbol freq
+	samples = butterworthLowPass(samples, sr, cutoff)
 
 	// Find sync signal
 	syncFreq := cfg.Frequencies[len(cfg.Frequencies)-1]
