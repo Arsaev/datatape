@@ -300,11 +300,24 @@ func encodeFileToWAV(inPath, outPath string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	// Header: store original length (uint32) then payload
-	var header bytes.Buffer
-	binary.Write(&header, binary.LittleEndian, uint32(len(data)))
-	header.Write(data)
-	payload := header.Bytes()
+	// Error correction: block parity
+	blockSize := 16
+	var eccBuf bytes.Buffer
+	binary.Write(&eccBuf, binary.LittleEndian, uint32(len(data)))
+	for i := 0; i < len(data); i += blockSize {
+		end := i + blockSize
+		if end > len(data) {
+			end = len(data)
+		}
+		block := data[i:end]
+		parity := byte(0)
+		for _, b := range block {
+			parity ^= b
+		}
+		eccBuf.Write(block)
+		eccBuf.WriteByte(parity)
+	}
+	payload := eccBuf.Bytes()
 
 	symbols := packBitsToSymbols(payload, cfg.BitsPerSymbol)
 
@@ -642,19 +655,35 @@ func decodeWAVToFile(inPath, outPath string, cfg Config) error {
 		return fmt.Errorf("unrealistic decoded length %d, likely corruption", origLen)
 	}
 
-	if int(origLen) > len(bits)-4 {
-		// Try to recover partial data
-		fmt.Printf("Warning: length mismatch, attempting partial recovery\n")
-		availableData := len(bits) - 4
-		if availableData > 0 {
-			origData := bits[4 : 4+availableData]
-			return os.WriteFile(outPath, origData, 0644)
+	// Error correction: check parity blocks
+	blockSize := 16
+	dataWithParity := bits[4:]
+	var recovered []byte
+	for i := 0; i < len(dataWithParity); i += blockSize + 1 {
+		end := i + blockSize
+		if end > len(dataWithParity)-1 {
+			end = len(dataWithParity) - 1
 		}
-		return fmt.Errorf("decoded length %d exceeds available data %d", origLen, len(bits)-4)
+		block := dataWithParity[i:end]
+		if end >= len(dataWithParity) {
+			break
+		}
+		parity := dataWithParity[end]
+		calcParity := byte(0)
+		for _, b := range block {
+			calcParity ^= b
+		}
+		if parity != calcParity {
+			fmt.Printf("Warning: parity error in block %d (offset %d)\n", i/(blockSize+1), i)
+			// Could attempt single-bit correction here (not implemented)
+		}
+		recovered = append(recovered, block...)
 	}
-
-	// Extract original data
-	origData := bits[4 : 4+origLen]
+	if int(origLen) > len(recovered) {
+		fmt.Printf("Warning: decoded length %d exceeds available data %d\n", origLen, len(recovered))
+		origLen = uint32(len(recovered))
+	}
+	origData := recovered[:origLen]
 
 	return os.WriteFile(outPath, origData, 0644)
 }
