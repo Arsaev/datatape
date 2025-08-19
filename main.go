@@ -321,23 +321,79 @@ func encodeFileToWAV(inPath, outPath string, cfg Config) error {
 
 	symbols := packBitsToSymbols(payload, cfg.BitsPerSymbol)
 
-	// Build waveform: silence, sync tone, preamble, payload
 	silenceN := int(0.25 * float64(cfg.SampleRate))
 	syncN := int(cfg.SyncSeconds * float64(cfg.SampleRate))
 	sps := cfg.SamplesPerSymbol
 	win := hannWindow(sps)
 	amp := cfg.Amplitude
 
-	total := make([]float64, 0, silenceN+syncN+len(symbols)*sps+cfg.PreambleSymbols*sps*2)
-	// 0.25 s silence
-	total = append(total, make([]float64, silenceN)...)
+	// Open output file for streaming write
+	outFile, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
 
-	// Sync tone at highest frequency
+	// Write WAV header placeholder (will update sizes later)
+	var wavHeader [44]byte
+	copy(wavHeader[0:], []byte("RIFF"))
+	copy(wavHeader[8:], []byte("WAVEfmt "))
+	binary.LittleEndian.PutUint32(wavHeader[4:], 36)  // will update later
+	binary.LittleEndian.PutUint32(wavHeader[16:], 16) // PCM fmt chunk size
+	binary.LittleEndian.PutUint16(wavHeader[20:], 1)  // PCM
+	binary.LittleEndian.PutUint16(wavHeader[22:], 1)  // mono
+	binary.LittleEndian.PutUint32(wavHeader[24:], uint32(cfg.SampleRate))
+	binary.LittleEndian.PutUint32(wavHeader[28:], uint32(cfg.SampleRate*2))
+	binary.LittleEndian.PutUint16(wavHeader[32:], 2)
+	binary.LittleEndian.PutUint16(wavHeader[34:], 16)
+	copy(wavHeader[36:], []byte("data"))
+	binary.LittleEndian.PutUint32(wavHeader[40:], 0) // will update later
+	if _, err := outFile.Write(wavHeader[:]); err != nil {
+		return err
+	}
+
+	// Helper to write samples and track maxAbs
+	var maxAbs float64
+	var totalSamples int
+	writeSamples := func(samples []float64) error {
+		for _, v := range samples {
+			if a := math.Abs(v); a > maxAbs {
+				maxAbs = a
+			}
+		}
+		ints := make([]int16, len(samples))
+		for i, v := range samples {
+			x := v
+			if x > 1 {
+				x = 1
+			}
+			if x < -1 {
+				x = -1
+			}
+			ints[i] = int16(math.Round(x * 32767))
+		}
+		buf := new(bytes.Buffer)
+		for _, s := range ints {
+			binary.Write(buf, binary.LittleEndian, s)
+		}
+		totalSamples += len(ints)
+		_, err := outFile.Write(buf.Bytes())
+		return err
+	}
+
+	// Write silence
+	if err := writeSamples(make([]float64, silenceN)); err != nil {
+		return err
+	}
+
+	// Sync tone
 	phase := 0.0
 	syncWave, phase := synthTone(cfg.Frequencies[len(cfg.Frequencies)-1], syncN, cfg.SampleRate, amp*0.8, phase, nil)
-	total = append(total, syncWave...)
+	if err := writeSamples(syncWave); err != nil {
+		return err
+	}
 
-	// Preamble: alternate low/high indexes
+	// Preamble
 	for i := 0; i < cfg.PreambleSymbols; i++ {
 		idx := 0
 		if i%2 == 1 {
@@ -345,41 +401,32 @@ func encodeFileToWAV(inPath, outPath string, cfg Config) error {
 		}
 		w, p := synthTone(cfg.Frequencies[idx], sps, cfg.SampleRate, amp, phase, win)
 		phase = p
-		total = append(total, w...)
+		if err := writeSamples(w); err != nil {
+			return err
+		}
 	}
 
-	// Payload symbols
+	// Payload
 	for _, s := range symbols {
 		f := cfg.Frequencies[s]
 		w, p := synthTone(f, sps, cfg.SampleRate, amp, phase, win)
 		phase = p
-		total = append(total, w...)
+		if err := writeSamples(w); err != nil {
+			return err
+		}
 	}
 
-	// Normalize to int16
-	var maxAbs float64
-	for _, v := range total {
-		if a := math.Abs(v); a > maxAbs {
-			maxAbs = a
-		}
+	// Normalize if needed (not possible with streaming, so just clamp)
+	// Update WAV header sizes
+	dataSize := totalSamples * 2
+	riffSize := 36 + dataSize
+	if _, err := outFile.Seek(4, io.SeekStart); err == nil {
+		binary.Write(outFile, binary.LittleEndian, uint32(riffSize))
 	}
-	norm := 1.0
-	if maxAbs > 0.99 {
-		norm = 0.99 / maxAbs
+	if _, err := outFile.Seek(40, io.SeekStart); err == nil {
+		binary.Write(outFile, binary.LittleEndian, uint32(dataSize))
 	}
-	ints := make([]int16, len(total))
-	for i, v := range total {
-		x := v * norm
-		if x > 1 {
-			x = 1
-		}
-		if x < -1 {
-			x = -1
-		}
-		ints[i] = int16(math.Round(x * 32767))
-	}
-
-	return writeWAV16(outPath, cfg.SampleRate, ints)
+	return nil
 }
 
 // goertzelMag computes the magnitude of a frequency using the Goertzel algorithm.
@@ -655,11 +702,16 @@ func decodeWAVToFile(inPath, outPath string, cfg Config) error {
 		return fmt.Errorf("unrealistic decoded length %d, likely corruption", origLen)
 	}
 
-	// Error correction: check parity blocks
+	// Error correction: check parity blocks and stream output
 	blockSize := 16
 	dataWithParity := bits[4:]
-	var recovered []byte
-	for i := 0; i < len(dataWithParity); i += blockSize + 1 {
+	outFile, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+	var written uint32
+	for i := 0; i < len(dataWithParity) && written < origLen; i += blockSize + 1 {
 		end := i + blockSize
 		if end > len(dataWithParity)-1 {
 			end = len(dataWithParity) - 1
@@ -677,15 +729,19 @@ func decodeWAVToFile(inPath, outPath string, cfg Config) error {
 			fmt.Printf("Warning: parity error in block %d (offset %d)\n", i/(blockSize+1), i)
 			// Could attempt single-bit correction here (not implemented)
 		}
-		recovered = append(recovered, block...)
+		toWrite := block
+		if written+uint32(len(block)) > origLen {
+			toWrite = block[:origLen-written]
+		}
+		if _, err := outFile.Write(toWrite); err != nil {
+			return err
+		}
+		written += uint32(len(toWrite))
 	}
-	if int(origLen) > len(recovered) {
-		fmt.Printf("Warning: decoded length %d exceeds available data %d\n", origLen, len(recovered))
-		origLen = uint32(len(recovered))
+	if written < origLen {
+		fmt.Printf("Warning: decoded length %d exceeds available data %d\n", origLen, written)
 	}
-	origData := recovered[:origLen]
-
-	return os.WriteFile(outPath, origData, 0644)
+	return nil
 }
 
 func main() {
@@ -695,7 +751,7 @@ func main() {
 		input    = flag.String("input", "", "input file")
 		output   = flag.String("output", "", "output file")
 		sr       = flag.Int("sr", 44100, "sample rate")
-		sps      = flag.Int("sps", 2205, "samples per symbol")
+		sps      = flag.Int("sps", 225, "samples per symbol")
 		bands    = flag.Int("bands", 4, "number of frequency bands (power of 2)")
 		freqsCSV = flag.String("freqs", "", "comma-separated frequencies")
 		showHelp = flag.Bool("help", false, "show help")
